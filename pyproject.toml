@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dltmle"
+version = "0.0.1"
+description = "Deep LTMLE: Longitudinal Targeted Minimum Loss-based Estimation with Temporal-Difference Heterogenous-Token Transformer"
+dependencies = ["numpy<2", "scipy", "torch", "lightning", "optuna", "tensorboard"]
+
+[tool.setuptools.packages.find]
+exclude = ["notebooks"]
