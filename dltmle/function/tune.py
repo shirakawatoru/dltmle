@@ -37,7 +37,7 @@ class DatasetWLACY(Dataset):
             'a': self.A[index],
         }
 
-def tune(rng_seed, hparam_candidates, W, L, A, C, Y, n_trials=100):
+def tune(rng_seed, hparam_candidates, W, L, A, C, Y, n_trials=100, log_hparams=True):
     '''fit the model using the training data
     
     Parameters
@@ -85,10 +85,11 @@ def tune(rng_seed, hparam_candidates, W, L, A, C, Y, n_trials=100):
             default_hp_metric=False,
             )
         
-        logger.log_hyperparams(
-            hparams,
-            metrics={'val/L':0, 'val/G':0, 'val/Q':0, 'val/GQ':0, 'val/Q_star':0}
-            )
+        if log_hparams:
+            logger.log_hyperparams(
+                hparams,
+                metrics={'val/L':0, 'val/G':0, 'val/Q':0, 'val/GQ':0, 'val/Q_star':0}
+                )
         
         trainer = pl.Trainer(
             max_epochs=hparams['max_epochs'],
