@@ -106,7 +106,7 @@ def tune(rng_seed, hparam_candidates, W, L, A, C, Y, n_trials=100, log_hparams=T
     
     study = optuna.create_study(
         direction='minimize',
-        sampler=optuna.samplers.NSGAIISampler(seed=np.random.randint(0, 2**32)),
+        sampler=optuna.samplers.NSGAIISampler(seed=np.random.randint(0, 2**32, dtype=np.int64)),
         )
     
     study.optimize(objective, n_trials=n_trials)
