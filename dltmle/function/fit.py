@@ -89,6 +89,8 @@ def fit(rng_seed, hparams, W, L, A, C, Y, a):
     
     loader = DataLoader(dataset, batch_size=hparams['batch_size'], shuffle=True)
     trainer.fit(model, loader)
+
+    model.solve_canonical_gradient_common_eps(trainer, loader, dataset.tau, stop_pnic_se_ratio=True)
     
     loader = DataLoader(dataset, batch_size=hparams['batch_size'], shuffle=False)
     preds = trainer.predict(model, loader)
