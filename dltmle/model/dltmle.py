@@ -4,26 +4,19 @@ import lightning.pytorch as L
 
 import numpy as np
 from scipy.special import logit, expit
+from transformers import get_cosine_schedule_with_warmup
 
 from ..utils import SinusoidalEncoder, solve_one_dimensional_submodel
 
 from functools import cache
 
 @cache
-def _get_attention_mask(tau, device):
-    # input nodes = [W[0:1], L[0:tau], A[0:tau], C[0:tau], Y[0:tau]]
+def _get_attention_mask(tau, num_node_types, device):
+    # input nodes = [W[0:1], node_type_0[0:tau], node_type_1[0:tau], ...]
     # DGP at t: L[t] > A[t]
-        
-    num_node_types = 4
 
-    I = torch.triu(torch.full((tau, tau), True), diagonal=1) # attention < t
-    J = torch.triu(torch.full((tau, tau), True), diagonal=0) # attention <= t
-
-    # [0, 1, 1, 1, 1]
-    # [0, I, J, J, J]
-    # [0, I, I, J, J]
-    # [0, I, I, I, J]
-    # [0, I, I, I, I]
+    I = torch.triu(torch.full((tau, tau), True), diagonal=1) # attention <= t
+    J = torch.triu(torch.full((tau, tau), True), diagonal=0) # attention < t
 
     mask = torch.full((tau * num_node_types + 1, tau * num_node_types + 1), True)
     mask[:, 0] = False
@@ -31,8 +24,29 @@ def _get_attention_mask(tau, device):
     for i in range(num_node_types):
         for j in range(num_node_types):
             mask[(i*tau+1):((i+1)*tau+1), (j*tau+1):((j+1)*tau+1)] = I if i >= j else J
-    
+
     return mask.to(device)
+
+
+class FiLMModulator(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.gamma = nn.Linear(d_model, d_model)
+        self.beta = nn.Linear(d_model, d_model)
+
+    def forward(self, h, z):
+        return self.gamma(z) * h + self.beta(z)
+
+
+class QBranch(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.modulator = FiLMModulator(d_model)
+        self.head = nn.Linear(d_model, 1)
+
+    def forward(self, h, z_treatment):
+        return self.head(self.modulator(h, z_treatment))
+
 
 class DeepLTMLE(L.LightningModule):
     def __init__(self,
@@ -47,26 +61,25 @@ class DeepLTMLE(L.LightningModule):
                  nhead=8,
                  dropout=0.1,
                  learning_rate=1e-3,
-                 alpha = 1,
-                 beta = 1,
+                 alpha=1,
+                 beta=1,
+                 ema_decay=0.99,
+                 warmup_ratio=0.05,
                  **kwargs):
         super().__init__()
 
         self.tau = tau
-
         self.hidden_size = hidden_size
         self.learning_rate = learning_rate
         self.alpha = alpha
         self.beta = beta
+        self.ema_decay = ema_decay
+        self.warmup_ratio = warmup_ratio
 
-        self.dim_input_L = dim_static + dim_dynamic
-
-        # embeddings
+        # embeddings: W, L, A only (C and Y not fed into transformer)
         self.emb_W = nn.Linear(dim_static, dim_emb)
         self.emb_L = nn.Linear(dim_dynamic, dim_emb)
         self.emb_A = nn.Linear(1, dim_emb)
-        self.emb_C = nn.Linear(1, dim_emb)
-        self.emb_Y = nn.Linear(1, dim_emb)
 
         # temporal embeddings
         self.emb_time = nn.Sequential(
@@ -74,8 +87,8 @@ class DeepLTMLE(L.LightningModule):
             nn.Linear(dim_emb_time, dim_emb_time)
         )
 
-        # type embeddings
-        self.emb_type = nn.Parameter(torch.randn(5, dim_emb_type), requires_grad=True)
+        # type embeddings: 3 types (W=0, L=1, A=2)
+        self.emb_type = nn.Parameter(torch.randn(3, dim_emb_type), requires_grad=True)
 
         # transformer encoder
         d_model = dim_emb + dim_emb_time + dim_emb_type
@@ -89,66 +102,66 @@ class DeepLTMLE(L.LightningModule):
         )
         self.transformer = nn.TransformerEncoder(self.transformer_layer, num_layers=num_layers)
 
-        self.logit_Q = nn.Linear(d_model, 1)
+        # propensity heads
         self.G_a = nn.Sequential(nn.Linear(d_model, 1), nn.Sigmoid())
         self.G_c = nn.Sequential(nn.Linear(d_model, 1), nn.Sigmoid())
+
+        # Q branches: critic (trained) + target (EMA of critic)
+        self.Q_critic_branch = QBranch(d_model)
+        self.Q_target_branch = QBranch(d_model)
+        self.Q_target_branch.requires_grad_(False)
+        self.Q_target_branch.load_state_dict(self.Q_critic_branch.state_dict())
 
         self.eps = nn.Parameter(torch.zeros(tau, requires_grad=False))
 
     def forward(self, batch):
         W, L, A, C, Y, a = batch["W"], batch["L"], batch["A"], batch["C"], batch["Y"], batch["a"]
-        
+
         batch_size, tau = L.shape[0], L.shape[1]
 
-        c = torch.zeros_like(C)
-
-        # embeddings
-        # shape (batch_size, tau, dim_emb)
+        # embeddings (W, L, A only)
         z_W = self.emb_W(W[:,None,:])
         z_L = self.emb_L(L)
         z_A = self.emb_A(A)
-        z_C = self.emb_C(C)
-        z_Y = self.emb_Y(Y)
-        z_a = self.emb_A(a)
-        z_c = self.emb_C(c)
 
-        # add time embeddings
-        # shape (batch_size, tau, dim_emb+dim_emb_time)
+        a_ones = torch.ones_like(a)
+        a_zeros = torch.zeros_like(a)
+        z_a_ones = self.emb_A(a_ones)
+        z_a_zeros = self.emb_A(a_zeros)
+        # z_a = self.emb_A(a)
+
+        # time embeddings
         T_W = self.emb_time(torch.tensor([-1])).repeat(batch_size, 1, 1)
         T = self.emb_time(torch.arange(tau)).repeat(batch_size, 1, 1)
 
-        # add type embeddings
-        # shape (batch_size, tau, dim_emb+dim_emb_time+dim_emb_type)
+        # type embeddings
         type_W = self.emb_type[0].repeat(batch_size, 1, 1)
         type_L = self.emb_type[1].repeat(batch_size, tau, 1)
         type_A = self.emb_type[2].repeat(batch_size, tau, 1)
-        type_C = self.emb_type[3].repeat(batch_size, tau, 1)
-        type_Y = self.emb_type[4].repeat(batch_size, tau, 1)
 
         z_W = torch.cat([z_W, T_W, type_W], axis=-1)
         z_L = torch.cat([z_L, T,   type_L], axis=-1)
         z_A = torch.cat([z_A, T,   type_A], axis=-1)
-        z_C = torch.cat([z_C, T,   type_C], axis=-1)
-        z_Y = torch.cat([z_Y, T,   type_Y], axis=-1)
-        z_a = torch.cat([z_a, T,   type_A], axis=-1)
-        z_c = torch.cat([z_c, T,   type_C], axis=-1)
+        z_a_ones = torch.cat([z_a_ones, T, type_A], axis=-1)
+        z_a_zeros = torch.cat([z_a_zeros, T, type_A], axis=-1)
 
-        # transformer
-        mask = _get_attention_mask(tau, z_L.device)
-        x = torch.cat([z_W, z_L, z_A, z_C, z_Y], axis=1) # shape: (batch_size, 4 * tau, dim_emb+dim_emb_time+dim_emb_type)
+        # transformer: [W, L, A], single pass
+        # input:  W[0:1], L[0:tau], A[0:tau]
+        # output: _[0:1], h[0:tau], z_A_out[0:tau]
+        mask = _get_attention_mask(tau, 2, z_L.device)
+        x = torch.cat([z_W, z_L, z_A], axis=1)
         x = self.transformer(x, mask=mask)
 
-        # C[t-1] > Y[t-1] > (L[t] > A[t] > C[t] > Y[t]) > L(t+1) > A(t+1)
+        h, z_A_out = x[:,1:,:].reshape(batch_size, 2, tau, -1).transpose(0, 1)
+        # h       = L[t] output: history summary, context excludes A[t]
+        # z_A_out = A[t] output: context includes A[t]
 
-        # input:  W[0:1], L[0:tau],   A[0:tau],   C[0:tau], Y[0:tau]
-        # output: _[0:1], G_a[0:tau], G_c[0:tau], Q[0:tau], _[0:tau]
-        z_G_a, z_G_c, z_Q, _ = x[:,1:,:].reshape(batch_size, 4, tau, -1).transpose(0, 1)
+        G_a = self.G_a(h)        # P(A[t]=a | W, L[0:t+1], A[0:t])
+        G_c = self.G_c(z_A_out)  # P(C[t]=0 | W, L[0:t+1], A[0:t+1])
 
-        G_a = self.G_a(z_G_a)
-        G_c = self.G_c(z_G_c)
-
+        # Q: FiLM(h, z_A) via critic branch
         logit_Q = torch.zeros(batch_size, tau + 1, 1, device=A.device)
-        logit_Q[:, 1:] = self.logit_Q(z_Q)
+        logit_Q[:, 1:] = self.Q_critic_branch(h, z_A)
 
         eps = self.eps.view(1, tau, 1).repeat(batch_size, 1, 1)
 
@@ -158,15 +171,13 @@ class DeepLTMLE(L.LightningModule):
         Q = torch.sigmoid(logit_Q)
         Q_star = torch.sigmoid(logit_Q_star)
 
-        # ----------------------------------------------
-        # Counterfactual
-        x = torch.cat([z_W, z_L, z_a, z_c, z_Y], axis=1) # shape: (batch_size, 3*tau, dim_emb+dim_emb_time+dim_emb_type)
-        x = self.transformer(x, mask=mask)
-
-        _, _, z_V, _ = x[:,1:,:].reshape(batch_size, 4, tau, -1).transpose(0, 1)
-
+        # V: FiLM(h, z_a) via target branch — no second transformer pass
         logit_V = torch.zeros(batch_size, tau + 1, 1, device=A.device)
-        logit_V[:, :-1] = self.logit_Q(z_V).detach() # block back propagation
+
+        logit_V_ones = self.Q_target_branch(h, z_a_ones).detach()
+        logit_V_zeros = self.Q_target_branch(h, z_a_zeros).detach()
+
+        logit_V[:, :-1] = logit_V_ones * a + logit_V_zeros * (1 - a)
 
         logit_V_star = torch.zeros(batch_size, tau + 1, 1, device=A.device)
         logit_V_star[:, :-1] = logit_V[:, :-1] + eps.detach()
@@ -176,9 +187,9 @@ class DeepLTMLE(L.LightningModule):
 
         # degeneration of Q
         Q, Q_star, V, V_star = self._set_deterministic_Q(Q, Q_star, V, V_star, Y)
- 
+
         # IPW
-        J_a = (A == a) / (G_a * A + (1 - G_a) * (1 - A)).detach()
+        J_a = (a * A + (1 - a) * (1 - A)) / (G_a * A + (1 - G_a) * (1 - A)).detach()
         g_a = torch.ones(batch_size, tau + 1, 1, device=A.device)
         g_a[:, 1:] = J_a.cumprod(dim=1)
 
@@ -202,7 +213,13 @@ class DeepLTMLE(L.LightningModule):
             "g": g,
             "IC": IC,
         }
-    
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        with torch.no_grad():
+            for pc, pt in zip(self.Q_critic_branch.parameters(),
+                              self.Q_target_branch.parameters()):
+                pt.lerp_(pc, 1 - self.ema_decay)
+
     def _set_deterministic_Q(self, Q, Q_star, V, V_star, Y):
         n, tau, _ = Y.shape
 
@@ -213,14 +230,14 @@ class DeepLTMLE(L.LightningModule):
         T0[:, 0] = 1
 
         V[:, -1] = Y[:, -1]
-        V[:, 1:-1] = torch.where(Y[:, :-1] == 1, 1, V[:, 1:-1]) # V_{t+1} = 1 if Y_t = 1 for t = 0, ..., tau-1    
-        
+        V[:, 1:-1] = torch.where(Y[:, :-1] == 1, 1, V[:, 1:-1]) # V_{t+1} = 1 if Y_t = 1 for t = 0, ..., tau-1
+
         Q = torch.where(R == 1, Q, 1) # Q_{t+2} = 1 if Y_t = 1 for t = 0, ..., tau-1
         Q = torch.where(T0 == 0, Q, V[:, 0].mean())
 
         V_star[:, -1] = Y[:, -1]
         V_star[:, 1:-1] = torch.where(Y[:, :-1] == 1, 1, V_star[:, 1:-1]) # Q_{t+1} = 1 if Y_t = 1 for t = 0, ..., tau-1
-        
+
         Q_star = torch.where(R == 1, Q_star, 1) # Q_{t+2} = 1 if Y_t = 1 for t = 0, ..., tau-1
         Q_star = torch.where(T0 == 0, Q_star, V_star[:, 0].mean())
 
@@ -266,7 +283,7 @@ class DeepLTMLE(L.LightningModule):
 
         for k, v in loss.items():
             self.log(f"train/{k}", v, on_step=False, on_epoch=True, prog_bar=(k == "L"), logger=True)
-        
+
         return loss["L"]
 
     def validation_step(self, batch, batch_idx):
@@ -274,13 +291,13 @@ class DeepLTMLE(L.LightningModule):
 
         for k, v in loss.items():
             self.log(f"val/{k}", v, on_step=False, on_epoch=True, prog_bar=(k == "L"), logger=True)
-    
+
     def test_step(self, batch, batch_idx):
         loss = self.loss(self(batch), batch)
 
         for k, v in loss.items():
             self.log(f"test/{k}", v, on_step=False, on_epoch=True, prog_bar=(k == "L"), logger=True)
-        
+
         return loss["L"]
 
     def predict_step(self, batch, batch_idx):
@@ -291,11 +308,23 @@ class DeepLTMLE(L.LightningModule):
         x["Q_l_star"] = x["Q_star"]
         x["Q_a"] = x["V"]
         x["Q_a_star"] = x["V_star"]
-        
+
         return x
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        trainable = [p for p in self.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable, lr=self.learning_rate)
+        total_steps = self.trainer.estimated_stepping_batches
+        warmup_steps = int(total_steps * self.warmup_ratio)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
 
     def solve_canonical_gradient(self, trainer, loader, tau):
         eps = torch.zeros(tau+1)
@@ -312,8 +341,8 @@ class DeepLTMLE(L.LightningModule):
 
         for t in reversed(range(tau)):
             eps[t] = solve_one_dimensional_submodel(
-                y_hat[:,t+1], 
-                expit(logit(y[:,t+1]) + float(eps[t+1])), 
+                y_hat[:,t+1],
+                expit(logit(y[:,t+1]) + float(eps[t+1])),
                 r[:,t] * g[:,t+1]
                 )
 
@@ -323,11 +352,11 @@ class DeepLTMLE(L.LightningModule):
 
     def solve_canonical_gradient_common_eps(
             self,
-            trainer, 
-            loader, 
-            tau, 
-            max_iter=1000, 
-            tol=1e-6, 
+            trainer,
+            loader,
+            tau,
+            max_iter=1000,
+            tol=1e-6,
             stop_pnic_se_ratio=False,
             max_delta_eps=None,
             ):

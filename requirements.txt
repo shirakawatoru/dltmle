@@ -5,3 +5,5 @@ torch
 lightning
 optuna
 tensorboard
+
+transformers

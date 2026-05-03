@@ -42,6 +42,7 @@ hparams_candidates = {
     'learning_rate': [1e-3, 5e-4, 1e-4, 5e-5],
     'alpha': [0.05, 0.1, 0.5, 1],
     'beta': [0.05, 0.1, 0.5, 1],
+    'ema_decay': [0.9, 0.95, 0.99],
     'max_epochs': [100],
     'batch_size': [64],
 }
@@ -76,3 +77,11 @@ Laan](https://vanderlaan-lab.org/)
 
 The contents of this repository are distributed under the MIT license.
 See file `LICENSE` for details.
+
+## History
+- 0.0.12
+    - Implement stochastic intervension
+    - Implement target Q head with a hyperparameter `ema_decay`
+    - Change state representation for $G$ by FiLM: $Z(W,L_{1:t},A_{1:t})=f(W,L_{1:t},A_{1:t-1})\odot\sigma(A_t)+\mu(A_t)$ with a Transforer $f$ and linear modules $\sigma$ and $\mu$.
+    - Implement cosine LR schduler
+
