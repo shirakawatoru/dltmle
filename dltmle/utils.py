@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import LambdaLR
 
 import numpy as np
 
@@ -72,6 +73,16 @@ def solve_one_dimensional_submodel(y_hat, y, H):
         return -np.mean(H * (y - s))
     
     return minimize(_loss, 0, method='L-BFGS-B', jac=_jac, tol=1e-14).x[0]
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int) -> LambdaLR:
+    """Cosine LR schedule with linear warmup (no external dependencies)."""
+    def lr_lambda(step: int) -> float:
+        if step < num_warmup_steps:
+            return step / max(1, num_warmup_steps)
+        progress = (step - num_warmup_steps) / max(1, num_training_steps - num_warmup_steps)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return LambdaLR(optimizer, lr_lambda)
+
 
 def get_torch_device(use_cpu=False):
     if use_cpu:

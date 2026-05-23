@@ -1,9 +1,0 @@
-numpy
-scipy
-
-torch
-lightning
-optuna
-tensorboard
-
-transformers
