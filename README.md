@@ -59,6 +59,57 @@ print('risk ratio', psi_1 / psi_0)
 print('odds ratio', (psi_1 / (1 - psi_1)) / (psi_0 / (1 - psi_0)))
 ```
 
+## Categorical treatment / censoring and the long-format API
+
+Treatments may have J classes and censoring K categories (0 = not censored,
+1..K-1 = censoring reasons); all censoring is prevented under the intervention.
+Interventions can be static, dynamic (a function of the observed history) or
+stochastic (class probabilities).
+
+```python
+import dltmle
+import numpy as np
+
+W, L, A, C, Y = dltmle.example_dgp_categorical(np.random.default_rng(0), 2000, 4,
+                                               n_treatment=3, n_censoring=3)
+res = dltmle.estimate(
+    W, L, A, C, Y,
+    intervention={
+        "always_0": 0,
+        "always_2": dltmle.Static(2),
+        "dynamic": dltmle.Dynamic(lambda W, L, A: np.where(L[..., 0] > 0, 2, 1)),
+        "random": dltmle.Stochastic([0.2, 0.3, 0.5]),
+    },
+    eval_times="all", seed=0, device="cpu",
+)
+print(res)                          # psi(t) = P(Y_t = 1), SE, 95% CI per regime / time
+print(res.contrasts("always_0"))    # risk differences / ratios
+res.to_json("result.json")          # estimates, IC per id, diagnostics, hparams, seed, version
+```
+
+Long-format (person-time) data, e.g. from R / stremr:
+
+```python
+res = dltmle.estimate_long(
+    df, id_col="ID", time_col="t", outcome_col="Y.tplus1", treatment_col="drug",
+    censoring_cols=["C_death", "C_admin"], static_cols=["age"], dynamic_cols=["hba1c"],
+    censoring_timing="before_treatment",   # stremr orders C(t) before A(t)
+    intervention={"SU": "SU", "SGLT2i": "SGLT2i"},
+)
+```
+
+Command line (Parquet / CSV in, JSON / CSV out):
+
+```bash
+python -m dltmle estimate --input data.parquet --id-col ID --time-col t \
+    --outcome-col Y --treatment-col drug --censoring-cols C \
+    --static-cols age --dynamic-cols hba1c \
+    --intervention SU=static:SU --intervention SGLT2i=static:SGLT2i \
+    --seed 1 --device cpu --deterministic --output result.json --estimates-csv est.csv
+```
+
+See [`docs/design-categorical-api.md`](docs/design-categorical-api.md) for the design notes.
+
 ## Citation
 
 ```bibtex
@@ -79,6 +130,14 @@ The contents of this repository are distributed under the MIT license.
 See file `LICENSE` for details.
 
 ## History
+- 0.1.0
+    - Categorical treatment (J classes, multinomial g^A) and categorical censoring (K categories, cause-specific g^C)
+    - Static / dynamic / stochastic interventions for categorical treatments (`dltmle.Static`, `Dynamic`, `Stochastic`)
+    - Stable high-level API `dltmle.estimate`, `estimate_long`, `estimate_file` returning `DLTMLEResult`
+      (per-time psi, SE, CI, IC per id, diagnostics, hparams, seed, version)
+    - CLI `python -m dltmle estimate ...`
+    - `device`, `deterministic`, `censoring_timing` options; multiple regimes / evaluation times with a shared G model
+    - IC is centred at the full-sample estimate (was: per-batch mean)
 - 0.0.12
     - Implement stochastic intervension
     - Implement target Q head with a hyperparameter `ema_decay`

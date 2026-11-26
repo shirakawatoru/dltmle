@@ -11,7 +11,8 @@ import optuna
 
 from ..model.dltmle import DeepLTMLE
 from ..utils import seed_everything, get_torch_device, get_cosine_schedule_with_warmup
-from .fit import _g_loss, _q_loss
+from ..model.categorical import mix_logits
+from .fit import _g_loss, _q_loss, _as_panel, _n_classes
 
 
 # ---------------------------------------------------------------------------
@@ -19,12 +20,16 @@ from .fit import _g_loss, _q_loss
 # ---------------------------------------------------------------------------
 
 class DatasetWLACY(Dataset):
-    def __init__(self, W, L, A, C, Y, dtype=torch.float32):
+    def __init__(self, W, L, A, C, Y, n_treatment=2, dtype=torch.float32):
         self.W = torch.tensor(W, dtype=dtype)
         self.L = torch.tensor(L, dtype=dtype)
         self.A = torch.tensor(A, dtype=dtype)
         self.C = torch.tensor(C, dtype=dtype)
         self.Y = torch.tensor(Y, dtype=dtype)
+        # observed treatment as stand-in intervention for tuning
+        self.gstar = torch.nn.functional.one_hot(
+            self.A.long().squeeze(-1), n_treatment
+        ).to(dtype)
 
         self.dim_static  = W.shape[1]
         self.dim_dynamic = L.shape[2]
@@ -40,7 +45,7 @@ class DatasetWLACY(Dataset):
             "A": self.A[index],
             "C": self.C[index],
             "Y": self.Y[index],
-            "a": self.A[index],   # use observed A as stand-in for tune
+            "gstar": self.gstar[index],   # observed A as stand-in for tune
         }
 
 
@@ -55,12 +60,11 @@ def _eval_gq_loss(model, loader, device, alpha: float, beta: float) -> float:
     total, n_batches = 0.0, 0
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
-        G_a, G_c = model.g_model(batch["W"], batch["L"], batch["A"])
-        logit_Q, logit_V = model.q_model(
-            batch["W"], batch["L"], batch["A"], batch["a"]
-        )
+        p_A, p_C = model.g_model(batch["W"], batch["L"], batch["A"])
+        logit_Q, logit_V_cls = model.q_model(batch["W"], batch["L"], batch["A"])
+        logit_V = mix_logits(logit_V_cls, batch["gstar"])
         loss = (
-            _g_loss(G_a, G_c, batch, alpha=alpha, beta=beta)
+            _g_loss(p_A, p_C, batch, alpha=alpha, beta=beta)
             + _q_loss(logit_Q, logit_V, batch)
         )
         total    += loss.item()
@@ -78,6 +82,8 @@ def tune(
     W, L, A, C, Y,
     n_trials: int = 100,
     log_hparams: bool = True,
+    n_treatment: int = None,
+    n_censoring: int = None,
 ):
     """Hyperparameter search via Optuna.
 
@@ -90,6 +96,8 @@ def tune(
     n_trials : int
     log_hparams : bool
         If True, log hyperparameters to TensorBoard.
+    n_treatment, n_censoring : int, optional
+        Number of treatment classes / censoring categories (inferred).
 
     Returns
     -------
@@ -98,7 +106,10 @@ def tune(
     seed_everything(rng_seed)
     device = get_torch_device()
 
-    dataset = DatasetWLACY(W, L, A, C, Y)
+    W, L, A, C, Y = _as_panel(W, L, A, C, Y)
+    J = _n_classes(A, n_treatment, "n_treatment")
+    K = _n_classes(C, n_censoring, "n_censoring")
+    dataset = DatasetWLACY(W, L, A, C, Y, n_treatment=J)
     train_set, val_set = random_split(dataset, [0.8, 0.2])
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -110,7 +121,8 @@ def tune(
         }
 
         model = DeepLTMLE(
-            dataset.dim_static, dataset.dim_dynamic, dataset.tau, **hparams
+            dataset.dim_static, dataset.dim_dynamic, dataset.tau,
+            n_treatment=J, n_censoring=K, **hparams
         )
         model.to(device)
 
@@ -152,13 +164,12 @@ def tune(
             for batch in train_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
 
-                G_a, G_c = model.g_model(batch["W"], batch["L"], batch["A"])
-                loss_g = _g_loss(G_a, G_c, batch, alpha=alpha, beta=beta)
+                p_A, p_C = model.g_model(batch["W"], batch["L"], batch["A"])
+                loss_g = _g_loss(p_A, p_C, batch, alpha=alpha, beta=beta)
                 opt_g.zero_grad(); loss_g.backward(); opt_g.step(); sched_g.step()
 
-                logit_Q, logit_V = model.q_model(
-                    batch["W"], batch["L"], batch["A"], batch["a"]
-                )
+                logit_Q, logit_V_cls = model.q_model(batch["W"], batch["L"], batch["A"])
+                logit_V = mix_logits(logit_V_cls, batch["gstar"])
                 loss_q = _q_loss(logit_Q, logit_V, batch)
                 opt_q.zero_grad(); loss_q.backward(); opt_q.step(); sched_q.step()
 

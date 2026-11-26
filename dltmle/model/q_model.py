@@ -108,31 +108,32 @@ class QModel(nn.Module):
         W: torch.Tensor,
         L: torch.Tensor,
         A: torch.Tensor,
-        a: torch.Tensor,
     ):
         """
         Parameters
         ----------
         W : (B, dim_static)
         L : (B, T, dim_dynamic)
-        A : (B, T, 1)  float observed treatment
-        a : (B, T, 1)  float counterfactual treatment
+        A : (B, T, 1)  observed treatment class index (float)
 
         Returns
         -------
-        logit_Q : (B, T, 1)  logit Q under observed A  (critic, has gradient)
-        logit_V : (B, T, 1)  logit V under counterfactual a  (target, detached)
+        logit_Q     : (B, T, 1)  logit Q under observed A  (critic, has gradient)
+        logit_V_cls : (B, T, J)  logit Q under each treatment class
+                      (EMA target, no gradient).  Combine with an
+                      intervention ``g*`` via
+                      :func:`dltmle.model.categorical.mix_logits`.
         """
         A_int = A.long().squeeze(-1)   # (B, T)
-        a_int = a.long().squeeze(-1)   # (B, T)
 
         z_L, _ = self.htt(W, L, A_int)
 
         logit_Q = self._eval_q(z_L, A_int, self.film_critic, self.q_critic)
         with torch.no_grad():
-            logit_V = self._eval_q(z_L, a_int, self.film_target, self.q_target)
+            z = self.film_target(z_L).transpose(-1, -2)    # (B, T, J, D)
+            logit_V_cls = self.q_target(z).squeeze(-1)      # (B, T, J)
 
-        return logit_Q, logit_V
+        return logit_Q, logit_V_cls
 
     def update_ema(self):
         """EMA update: target ← (1-decay)*critic + decay*target."""
