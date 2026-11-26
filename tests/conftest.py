@@ -47,3 +47,65 @@ LINEAR_HPARAMS = {
     "max_epochs":    200,
     "batch_size":    256,
 }
+
+
+# ---------------------------------------------------------------------------
+# Categorical treatment / censoring fixtures
+# ---------------------------------------------------------------------------
+
+import torch
+
+# tiny models: per-op threading overhead dominates; keep runs fast and stable
+torch.set_num_threads(min(4, torch.get_num_threads()))
+
+CAT_TAU = 3
+CAT_N = 3000
+
+
+def cat_dynamic_dgp(t, W, L_hist, A_hist):
+    """Dynamic regime used in the DGP: class 2 if L_0 > 0 else class 0."""
+    return np.where(L_hist[:, 0] > 0, 2, 0)
+
+
+def cat_dynamic_est(W, L, A):
+    """Same regime evaluated on observed panel arrays."""
+    return np.repeat(np.where(L[:, 0, 0] > 0, 2, 0)[:, None], L.shape[1], axis=1)
+
+
+CAT_STOCHASTIC = [0.2, 0.3, 0.5]
+
+
+@pytest.fixture(scope="session")
+def cat_data():
+    """Observational data with J=3 treatment classes and K=3 censoring categories."""
+    return dltmle.example_dgp_categorical(np.random.default_rng(0), n=CAT_N, tau=CAT_TAU)
+
+
+@pytest.fixture(scope="session")
+def cat_truth():
+    """Oracle P(Y_{tau-1}=1) under each regime (no censoring), by simulation."""
+    def _truth(regime):
+        Y = dltmle.example_dgp_categorical(
+            np.random.default_rng(99), n=300_000, tau=CAT_TAU, regime=regime)[4]
+        return float(Y[:, -1].mean())
+    return {
+        "s0": _truth(0), "s1": _truth(1), "s2": _truth(2),
+        "dyn": _truth(cat_dynamic_dgp), "sto": _truth(CAT_STOCHASTIC),
+    }
+
+
+LINEAR_CAT_HPARAMS = {
+    "learning_rate": 1e-2,
+    "max_epochs":    100,
+    "batch_size":    256,
+}
+
+TINY_DEEP_HPARAMS = {
+    "dim_model":     16,
+    "num_layers":    1,
+    "nhead":         2,
+    "dropout":       0.0,
+    "learning_rate": 1e-3,
+    "max_epochs":    3,
+    "batch_size":    128,
+}
